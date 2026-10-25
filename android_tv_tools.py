@@ -406,6 +406,255 @@ def _parse_density(text: str) -> str:
         return f"{override} dpi (physical {physical})"
     return f"{physical} dpi" if physical else "—"
 
+# ── health check (Performance tab) ─────────────────────────────────────────────
+# Read-only scan: every command below only reports state. Fixes are separate
+# commands the user triggers per finding.
+_HEALTH_SCRIPT = (
+    "echo @@meminfo; cat /proc/meminfo; "
+    "echo @@df; df -k /data 2>/dev/null; "
+    "echo @@settings; for k in window_animation_scale transition_animation_scale "
+    "animator_duration_scale cached_apps_freezer; do echo $k=$(settings get global $k); done; "
+    "echo @@pss; dumpsys meminfo 2>/dev/null | sed -n '/Total [PR]SS by process/,/^$/p'; "
+    "echo @@cpu; dumpsys cpuinfo 2>/dev/null; "
+    "echo @@all_pkgs; pm list packages; "
+    "echo @@user_pkgs; pm list packages -3; "
+    "echo @@disabled; pm list packages -d; "
+    "echo @@disk; dumpsys diskstats 2>/dev/null; "
+    "echo @@usage; dumpsys usagestats 2>/dev/null "
+    "| sed -n '/In-memory monthly stats/,/In-memory yearly stats/p' | grep package=; "
+    "echo @@top; dumpsys activity activities 2>/dev/null | grep -m1 -E 'mResumedActivity|ResumedActivity'"
+)
+
+# Preinstalled services that run in the background on many TVs and can be
+# turned off without breaking the TV: package -> (name, what it does, cost).
+_KNOWN_SERVICES = {
+    "tv.samba.ssm": (
+        "Samba TV", "Recognises what is on screen to build viewing and ad data; runs constantly.",
+        "Samba TV recommendations."),
+    "com.google.android.katniss": (
+        "Google Assistant", "Voice search and the Assistant.",
+        "voice search and the remote's mic button."),
+    "com.google.android.apps.mediashell": (
+        "Chromecast built-in", "Lets phones cast to the TV.",
+        "casting from phones and Chrome."),
+    "com.sony.dtv.airplayapp": (
+        "AirPlay", "Lets Apple devices cast to the TV.",
+        "AirPlay from iPhone, iPad and Mac."),
+    "com.vewd.core.service": (
+        "Vewd", "Browser engine for broadcast red-button (HbbTV) extras.",
+        "red-button extras on broadcast channels, and possibly some built-in web apps."),
+    "com.uei.quicksetsdk.sony": (
+        "UEI QuickSet", "Lets the TV remote control other devices (set-top boxes, soundbars).",
+        "controlling other devices with the TV remote."),
+}
+
+_MB = 1024 * 1024
+
+def _parse_pkg_list(text: str) -> set:
+    return {l.strip()[8:] for l in text.splitlines() if l.strip().startswith("package:")}
+
+def _parse_settings(text: str) -> dict:
+    out = {}
+    for line in text.splitlines():
+        key, sep, val = line.strip().partition("=")
+        if sep:
+            out[key] = val.strip()
+    return out
+
+def _parse_pss(text: str) -> dict:
+    """`dumpsys meminfo` process totals → {package: bytes}. Prefers the PSS
+    table (Android 13+ also prints RSS first). Multi-process apps
+    (com.app:service) are summed under their package."""
+    tables, current = {}, None
+    for line in text.splitlines():
+        m = _re.match(r'\s*Total (PSS|RSS) by process:', line)
+        if m:
+            current = tables.setdefault(m.group(1), {})
+            continue
+        m = _re.match(r'\s*([\d,]+)K: (\S+) \(pid', line)
+        if m and current is not None:
+            pkg = m.group(2).split(":")[0]
+            current[pkg] = current.get(pkg, 0) + int(m.group(1).replace(",", "")) * 1024
+    return tables.get("PSS") or tables.get("RSS") or {}
+
+def _parse_cpuinfo(text: str):
+    """`dumpsys cpuinfo` → (total busy %, [(pct, package or process), ...])."""
+    total, procs = None, []
+    for line in text.splitlines():
+        m = _re.match(r'\s*([\d.]+)% TOTAL:', line)
+        if m:
+            total = float(m.group(1))
+            continue
+        m = _re.match(r'\s*([\d.]+)% \d+/([^:\s]+):', line)
+        if m:
+            procs.append((float(m.group(1)), m.group(2).split(":")[0]))
+    return total, procs
+
+def _usage_secs(s: str) -> int:
+    """'35:17:55' / '25:54' (UsageStats elapsed time) → seconds."""
+    try:
+        parts = [int(p) for p in s.split(":")]
+    except ValueError:
+        return 0
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + p
+    return secs
+
+def _parse_usage(text: str) -> dict:
+    """Monthly `dumpsys usagestats` lines → {package: seconds on screen}."""
+    usage = {}
+    for m in _re.finditer(r'package=(\S+) totalTimeUsed="([^"]*)"', text):
+        usage[m.group(1)] = max(usage.get(m.group(1), 0), _usage_secs(m.group(2)))
+    return usage
+
+def _parse_diskstats(text: str) -> list:
+    """`dumpsys diskstats` → [(package, apk, data, cache)] in bytes. These
+    come from a periodic system job, so they can be up to a day old."""
+    def arr(name):
+        m = _re.search(rf'^{name}: \[(.*)\]', text, _re.M)
+        return [v.strip().strip('"') for v in m.group(1).split(",")] if m and m.group(1) else []
+    names = arr("Package Names")
+    apps, data, cache = arr("App Sizes"), arr("App Data Sizes"), arr("Cache Sizes")
+    rows = []
+    for i, name in enumerate(names):
+        try:
+            rows.append((name, int(apps[i]), int(data[i]), int(cache[i])))
+        except (IndexError, ValueError):
+            pass
+    return rows
+
+def _resumed_package(text: str) -> str:
+    m = _re.search(r'u\d+ ([\w.]+)/', text)
+    return m.group(1) if m else ""
+
+def _app_label(pkg: str) -> str:
+    known = _KNOWN_SERVICES.get(pkg)
+    return known[0] if known else _pretty_pkg_name(pkg)
+
+def _health_findings(sec: dict) -> list:
+    """Turn _HEALTH_SCRIPT output into findings for the Health Check panel.
+    Each finding: {severity: bad|warn|ok|info, title, detail,
+    actions: [(label, kind, arg)], items: [(text, [(label, kind, arg)])]}."""
+    findings = []
+    all_pkgs  = _parse_pkg_list(sec.get("all_pkgs", ""))
+    user_pkgs = _parse_pkg_list(sec.get("user_pkgs", ""))
+    disabled  = _parse_pkg_list(sec.get("disabled", ""))
+    foreground = _resumed_package(sec.get("top", ""))
+
+    # Storage — `df -k /data` returns the one filesystem holding /data, but
+    # the mount it reports can be a bind like /data/user/0, so take it as is.
+    df_rows = _parse_df(sec.get("df", ""))
+    internal = df_rows[0][1:] if df_rows else None
+    caches = sorted(((c, p) for p, _a, _d, c in _parse_diskstats(sec.get("disk", ""))
+                     if c >= 50 * _MB), reverse=True)[:5]
+    if internal and internal[0]:
+        total, _used, avail = internal
+        free_pct = avail / total * 100
+        sev = "bad" if free_pct < 15 else "warn" if free_pct < 25 else "ok"
+        detail = f"{_fmt_bytes(avail)} free of {_fmt_bytes(total)} ({free_pct:.0f}%)."
+        if sev != "ok":
+            detail += (" With this little space Android skips its background app"
+                       " optimisation, and the flash storage gets slower.")
+        if caches:
+            detail += "\nLargest app caches: " + ", ".join(
+                f"{_app_label(p)} {_fmt_bytes(c)}" for c, p in caches)
+        findings.append({"severity": sev, "title": "Storage", "detail": detail,
+                         "actions": [("Clear All App Caches", "trim_caches", None)]
+                                    if sev != "ok" or caches else [],
+                         "items": []})
+
+    # Memory
+    mem = _parse_meminfo(sec.get("meminfo", ""))
+    if mem.get("MemTotal"):
+        total = mem["MemTotal"]
+        avail = mem.get("MemAvailable", mem.get("MemFree", 0) + mem.get("Cached", 0))
+        avail_pct = avail / total * 100
+        swap_total, swap_free = mem.get("SwapTotal", 0), mem.get("SwapFree", 0)
+        swap_full = swap_total and swap_free < swap_total * 0.05
+        sev = ("bad" if avail_pct < 15 or (swap_full and avail_pct < 25)
+               else "warn" if avail_pct < 25 or swap_full else "ok")
+        detail = f"{_fmt_bytes(avail)} available of {_fmt_bytes(total)} ({avail_pct:.0f}%)."
+        if swap_total:
+            detail += f" Swap {_fmt_bytes(swap_total - swap_free)} of {_fmt_bytes(swap_total)} used."
+        if sev != "ok":
+            detail += " Android has to close and reload apps when you switch, which feels like lag."
+        items = []
+        pss = _parse_pss(sec.get("pss", ""))
+        stoppable = [(size, p) for p, size in pss.items()
+                     if (p in user_pkgs or p in _KNOWN_SERVICES)
+                     and p != foreground and p not in disabled and size >= 20 * _MB]
+        for size, p in sorted(stoppable, reverse=True)[:6]:
+            items.append((f"{_app_label(p)}  ({p}) — {_fmt_bytes(size)}",
+                          [("Stop", "stop", p)]))
+        if items:
+            detail += "\nBiggest background apps you can stop (they restart when opened):"
+        findings.append({"severity": sev, "title": "Memory", "detail": detail,
+                         "actions": [], "items": items})
+
+    # CPU
+    busy, procs = _parse_cpuinfo(sec.get("cpu", ""))
+    if busy is not None:
+        sev = "warn" if busy >= 70 else "ok"
+        detail = (f"{busy:.0f}% busy on average over the last minute or so. (The Linux"
+                  " load average is misleading on TV chips: it counts idle driver threads.)")
+        hogs = [(pct, p) for pct, p in procs
+                if pct >= 3 and (p in user_pkgs or p in _KNOWN_SERVICES) and p != foreground]
+        items = [(f"{_app_label(p)}  ({p}) — {pct:.0f}% CPU", [("Stop", "stop", p)])
+                 for pct, p in hogs[:5]]
+        if items:
+            detail += "\nBackground apps using noticeable CPU:"
+        findings.append({"severity": sev, "title": "CPU", "detail": detail,
+                         "actions": [], "items": items})
+
+    # Unused apps
+    usage = _parse_usage(sec.get("usage", ""))
+    if usage and user_pkgs:
+        unused = sorted(p for p in user_pkgs
+                        if usage.get(p, 0) < 60 and p not in disabled and p != foreground)
+        detail = (f"{len(unused)} installed app(s) had less than a minute on screen this"
+                  " month. Apps that only work in the background (VPNs, file servers)"
+                  " can show up here even if you rely on them." if unused
+                  else "Every installed app has been used this month.")
+        findings.append({"severity": "warn" if unused else "ok", "title": "Unused Apps",
+                         "detail": detail, "actions": [],
+                         "items": [(f"{_app_label(p)}  ({p})", [("Uninstall", "uninstall", p)])
+                                   for p in unused]})
+
+    # Known background services
+    services = [p for p in _KNOWN_SERVICES if p in all_pkgs and p not in disabled]
+    if services:
+        findings.append({
+            "severity": "info", "title": "Optional Background Services",
+            "detail": "Preinstalled services that stay loaded. Only turn off what you"
+                      " don't use; re-enable any of them from Packages → Enable.",
+            "actions": [],
+            "items": [(f"{_KNOWN_SERVICES[p][0]}: {_KNOWN_SERVICES[p][1]}"
+                       f"\nTurning it off loses {_KNOWN_SERVICES[p][2]}",
+                       [("Disable", "disable", p)]) for p in services]})
+
+    # Quick tweaks already applied?
+    settings = _parse_settings(sec.get("settings", ""))
+    def scale(k):
+        try:
+            return float(settings.get(k, "1"))
+        except ValueError:   # "null" = never set = default 1×
+            return 1.0
+    anim_ok = all(scale(k) <= 0.5 for k in
+                  ("window_animation_scale", "transition_animation_scale", "animator_duration_scale"))
+    freezer_ok = settings.get("cached_apps_freezer") == "enabled"
+    if settings:
+        actions = []
+        if not anim_ok:
+            actions.append(("Speed Up Animations (0.5×)", "animations", "0.5"))
+        if not freezer_ok:
+            actions.append(("Enable App Freezer", "freezer", None))
+        detail = ("Animations: " + ("already sped up." if anim_ok else "normal speed.")
+                  + "  App freezer: " + ("on." if freezer_ok else "off."))
+        findings.append({"severity": "ok" if not actions else "info", "title": "Quick Tweaks",
+                         "detail": detail, "actions": actions, "items": []})
+    return findings
+
 # ── network scan ───────────────────────────────────────────────────────────────
 def check_host(ip, port, result_queue):
     try:
@@ -1186,8 +1435,28 @@ class App(ctk.CTk):
                      text_color=WARNING, font=ctk.CTkFont(family=_FONT, size=11)).grid(
                      row=1, column=0, columnspan=2, pady=(0, 10))
 
+        # Health Check — read-only scan; each finding carries its own fixes
+        health = Panel(tab)
+        health.grid(row=2, column=0, columnspan=2, padx=8, pady=4, sticky="ew")
+        head = ctk.CTkFrame(health, fg_color="transparent")
+        head.pack(fill="x", padx=14, pady=(12, 4))
+        ctk.CTkLabel(head, text="Health Check",
+                     font=ctk.CTkFont(family=_FONT, size=12, weight="bold"),
+                     text_color=TEXT_MUTED).pack(side="left")
+        self._health_btn = PrimaryButton(head, text="Run Health Check", width=160, height=34,
+                                         command=self._run_health_check)
+        self._health_btn.pack(side="right")
+        self._health_status = ctk.CTkLabel(
+            health, text="Scans memory, storage, CPU and apps. Read-only: nothing on the"
+                         " TV changes unless you press a fix button.",
+            text_color=TEXT_DISABLED, font=ctk.CTkFont(family=_FONT, size=11),
+            justify="left", wraplength=700)
+        self._health_status.pack(padx=14, pady=(0, 10), anchor="w")
+        self._health_results = ctk.CTkFrame(health, fg_color="transparent")
+        self._health_results.pack(fill="x", padx=8, pady=(0, 8))
+
         left_card = Panel(tab)
-        left_card.grid(row=2, column=0, padx=(8, 4), pady=4, sticky="ew")
+        left_card.grid(row=3, column=0, padx=(8, 4), pady=4, sticky="ew")
 
         ctk.CTkLabel(left_card, text="Optimizations",
                      font=ctk.CTkFont(family=_FONT, size=12, weight="bold"),
@@ -1202,7 +1471,7 @@ class App(ctk.CTk):
                       command=self._all_optimizations).pack(fill="x", padx=12, pady=(4, 12))
 
         right_card = Panel(tab)
-        right_card.grid(row=2, column=1, padx=(4, 8), pady=4, sticky="ew")
+        right_card.grid(row=3, column=1, padx=(4, 8), pady=4, sticky="ew")
 
         ctk.CTkLabel(right_card, text="Animations & Memory",
                      font=ctk.CTkFont(family=_FONT, size=12, weight="bold"),
@@ -2920,13 +3189,133 @@ class App(ctk.CTk):
             self._log("Animation scale updated.")
         threading.Thread(target=run, daemon=True).start()
 
-    def _clear_all_caches(self):
+    def _data_free(self):
+        """Free bytes on the /data partition, or None if df can't be read."""
+        rows = _parse_df(adb_out("shell", "df", "-k", "/data", serial=self.serial))
+        return rows[0][3] if rows else None
+
+    def _clear_all_caches(self, on_done=None):
         if not self._require_connection():
             return
         def run():
-            self._log("Trimming all app caches...")
-            result = adb("shell", "pm", "trim-caches", "0", serial=self.serial, timeout=30)
-            self._log(result or "Caches trimmed.")
+            self._log("Clearing all app caches...")
+            before = self._data_free()
+            # trim-caches deletes cache only until the requested amount of
+            # space is free, so "0" frees nothing. Ask for far more than any
+            # TV has (1 TiB) to clear every app's cache.
+            result = adb("shell", "pm", "trim-caches", str(1 << 40),
+                         serial=self.serial, timeout=180)
+            after = self._data_free()
+            if result:
+                self._log(result)
+            if before is not None and after is not None:
+                self._log(f"Freed {_fmt_bytes(max(after - before, 0))}; "
+                          f"{_fmt_bytes(after)} now free.")
+            else:
+                self._log("Caches cleared.")
+            if on_done:
+                self.after(0, on_done)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _run_health_check(self):
+        if not self._require_connection():
+            return
+        self._health_btn.configure(state="disabled", text="Scanning…")
+        self._health_status.configure(text="Scanning the TV (about 10–20 seconds)…")
+        serial = self.serial
+        def run():
+            raw = adb_out("shell", _HEALTH_SCRIPT, serial=serial, timeout=90)
+            findings = None
+            if raw != "TIMEOUT" and not raw.startswith("ERROR:"):
+                try:
+                    findings = _health_findings(_split_sections(raw))
+                except Exception as e:   # never leave the button stuck on "Scanning…"
+                    raw = f"could not read scan output ({e})"
+            self.after(0, lambda: self._show_health(findings, raw))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_health(self, findings, raw):
+        self._health_btn.configure(state="normal", text="Run Health Check")
+        for w in self._health_results.winfo_children():
+            w.destroy()
+        if not findings:
+            self._health_status.configure(
+                text=f"Scan failed: {raw[:200] if raw else 'no output'}", text_color=DANGER)
+            return
+        problems = sum(f["severity"] in ("bad", "warn") for f in findings)
+        self._health_status.configure(
+            text=(f"{problems} thing(s) worth fixing. " if problems else "Looks healthy. ")
+                 + f"Scanned {_dt.now().strftime('%H:%M')}. Nothing changes unless you press a fix button.",
+            text_color=TEXT_DISABLED)
+        colors = {"bad": DANGER, "warn": WARNING, "ok": SUCCESS, "info": PRIMARY}
+        small = ctk.CTkFont(family=_FONT, size=11)
+        for f in findings:
+            card = ctk.CTkFrame(self._health_results, fg_color=SURFACE_2,
+                                corner_radius=RADIUS_MD, border_width=1, border_color=BORDER)
+            card.pack(fill="x", padx=4, pady=4)
+            top = ctk.CTkFrame(card, fg_color="transparent", corner_radius=0)
+            top.pack(fill="x", padx=12, pady=(8, 2))
+            ctk.CTkLabel(top, text="●", text_color=colors[f["severity"]],
+                         font=ctk.CTkFont(family=_FONT, size=14)).pack(side="left", padx=(0, 6))
+            ctk.CTkLabel(top, text=f["title"], text_color=TEXT,
+                         font=ctk.CTkFont(family=_FONT, size=13, weight="bold")).pack(side="left")
+            for label, kind, arg in reversed(f["actions"]):
+                SecondaryButton(top, text=label, height=30,
+                                command=lambda k=kind, a=arg: self._health_fix(k, a)).pack(
+                    side="right", padx=(6, 0))
+            ctk.CTkLabel(card, text=f["detail"], text_color=TEXT_MUTED, font=small,
+                         justify="left", anchor="w", wraplength=680).pack(
+                fill="x", padx=12, pady=(0, 6))
+            for text, actions in f["items"]:
+                row = ctk.CTkFrame(card, fg_color="transparent", corner_radius=0)
+                row.pack(fill="x", padx=24, pady=1)
+                for label, kind, arg in reversed(actions):
+                    btn_cls = DangerButton if kind == "uninstall" else SecondaryButton
+                    btn_cls(row, text=label, width=86, height=28,
+                            command=lambda k=kind, a=arg: self._health_fix(k, a)).pack(
+                        side="right", padx=(6, 0))
+                ctk.CTkLabel(row, text=text, text_color=TEXT, font=small, justify="left",
+                             anchor="w", wraplength=560).pack(side="left", fill="x")
+            ctk.CTkFrame(card, fg_color="transparent", height=4).pack()
+
+    def _health_fix(self, kind, arg):
+        """Apply one Health Check fix after confirming, then rescan."""
+        from tkinter import messagebox
+        if not self._require_connection():
+            return
+        if kind == "animations":
+            self._set_animations(arg)
+            return
+        if kind == "freezer":
+            self._enable_freezer()
+            return
+        if kind == "trim_caches":
+            if messagebox.askyesno(
+                    "Clear All App Caches",
+                    "Clear the cache of every app on the TV?\n\nLogins and settings are kept;"
+                    " apps rebuild their caches, so the first launch of each may be a little"
+                    " slower. Streaming apps lose any video they had cached."):
+                self._clear_all_caches(on_done=self._run_health_check)
+            return
+        name = _app_label(arg)
+        prompts = {
+            "stop": ("Stop App", f"Force-stop {name} ({arg})?\n\nIt closes now and starts"
+                     " again next time you open it. A VPN will disconnect.",
+                     ("shell", "am", "force-stop", arg), "Stopping"),
+            "disable": ("Disable Service", f"Disable {name} ({arg})?\n\nYou can turn it back"
+                        " on any time from Packages → Enable.",
+                        ("shell", "pm", "disable-user", "--user", "0", arg), "Disabling"),
+            "uninstall": ("Uninstall App", f"Uninstall {name} ({arg})?\n\nThis removes the"
+                          " app and its data.",
+                          ("shell", "pm", "uninstall", "--user", "0", arg), "Uninstalling"),
+        }
+        title, question, cmd, verb = prompts[kind]
+        if not messagebox.askyesno(title, question):
+            return
+        def run():
+            self._log(f"{verb} {arg}...")
+            self._log(adb(*cmd, serial=self.serial, timeout=30) or "Done.")
+            self.after(0, self._run_health_check)
         threading.Thread(target=run, daemon=True).start()
 
     def _kill_background_apps(self):
